@@ -1,0 +1,54 @@
+# DICOMweb (QIDO-RS + WADO-RS).
+#
+# Connector uses urllib (not requests) — works because the Interceptor
+# patches both. Endpoints return raw arrays; QIDO-RS treats an empty
+# response as "no records", which is exactly what we want for offline
+# tests.
+
+endpoints:
+  - path: /studies
+    method: GET
+    corpus: studies
+    response:
+      pagination_style: none
+      single_entity: true
+
+  - path: /studies/{study_uid}/series
+    method: GET
+    corpus: series
+    response:
+      pagination_style: none
+      single_entity: true
+
+  - path: /studies/{study_uid}/series/{series_uid}/instances
+    method: GET
+    corpus: instances
+    response:
+      pagination_style: none
+      single_entity: true
+
+  - path: /studies/{study_uid}/series/{series_uid}/metadata
+    method: GET
+    corpus: instances
+    response:
+      pagination_style: none
+      single_entity: true
+
+  - path: /studies/{study_uid}/series/{series_uid}/instances/{sop_uid}/metadata
+    method: GET
+    corpus: instances
+    response:
+      pagination_style: none
+      single_entity: true
+
+  # WADO-RS instance retrieval. The connector calls this when
+  # fetch_dicom_files=true (dicomweb.py::_attach_dicom_file). A real server
+  # returns multipart/related DICOM bytes; the corpus stores JSON only, so
+  # this endpoint serves a stub response. The connector treats any non
+  # multipart/related body as raw DICOM bytes and writes it to the volume,
+  # which is enough to populate the dicom_file_path column for tests.
+  - path: /studies/{study_uid}/series/{series_uid}/instances/{sop_uid}
+    method: GET
+    response:
+      pagination_style: none
+      single_entity: true

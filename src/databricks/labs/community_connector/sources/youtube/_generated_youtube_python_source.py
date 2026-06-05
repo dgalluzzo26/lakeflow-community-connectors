@@ -42,7 +42,6 @@ from pyspark.sql.types import (
 )
 import base64
 import requests
-import uuid
 
 
 def register_lakeflow_source(spark):
@@ -679,7 +678,7 @@ def register_lakeflow_source(spark):
     # ---------------------------------------------------------------------------
 
     # search: GET /search (returns id.videoId, id.channelId, id.playlistId + snippet)
-    # search_query + result_index: unique across runs (each run emits 0,1,2,... so query disambiguates)
+    # search_query + result_index: stable PK per query (result_index is 0-based position in results)
     SEARCH_SCHEMA = StructType(
         [
             StructField("search_query", StringType(), nullable=False),
@@ -794,7 +793,7 @@ def register_lakeflow_source(spark):
         },
         "activities": {
             "primary_keys": ["id"],
-            "cursor_field": "snippet_publishedAt",
+            "cursor_field": None,
             "ingestion_type": "snapshot",
         },
         "comment_threads": {
@@ -839,6 +838,79 @@ def register_lakeflow_source(spark):
             return max(1, min(n, cap))
         except ValueError:
             return min(default, cap)
+
+
+    def _retry_wait_seconds(resp: requests.Response, backoff: float) -> float:
+        """Seconds to sleep before retry; honor Retry-After when present."""
+        retry_after = resp.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return float(retry_after)
+            except (TypeError, ValueError):
+                pass
+        return backoff
+
+
+    def _youtube_error_fields(resp: requests.Response) -> tuple[str, str]:
+        """Parse Google API error JSON into (reason, message)."""
+        try:
+            err = resp.json().get("error", {})
+            errors = err.get("errors") or [{}]
+            reason = (errors[0].get("reason") or "") if errors else ""
+            message = err.get("message") or reason or resp.reason
+            return str(reason), str(message)[:300]
+        except Exception:
+            return "", (resp.text or resp.reason or "unknown error")[:300]
+
+
+    def _raise_for_youtube_api_error(
+        resp: requests.Response,
+        path: str,
+        *,
+        detail: str | None = None,
+    ) -> None:
+        """Raise ValueError with actionable text for common YouTube API failures."""
+        if resp.ok:
+            return
+        reason, message = _youtube_error_fields(resp)
+        status = resp.status_code
+
+        if status == 401:
+            raise ValueError(
+                f"YouTube API {path} returned 401 Unauthorized. "
+                "Verify API key or OAuth credentials. OAuth is required for mine=true "
+                "and other private data. "
+                f"Detail: {message}"
+            )
+        if status == 403:
+            if reason == "quotaExceeded":
+                raise ValueError(
+                    f"YouTube API {path} returned 403: quota exceeded. "
+                    "Reduce sync frequency (search costs 100 units per request) or "
+                    "request a quota increase in Google Cloud Console. "
+                    f"Detail: {message}"
+                )
+            if path == "commentThreads":
+                ctx = f" ({detail})" if detail else ""
+                raise ValueError(
+                    f"comment_threads returned 403 Forbidden{ctx}. Comments may be disabled "
+                    "for this video or channel, or access may be restricted. Prefer video_id "
+                    "over channel_id; see README. "
+                    f"API reason: {reason or message}"
+                )
+            raise ValueError(
+                f"YouTube API {path} returned 403 Forbidden. "
+                f"Reason: {reason or message}. "
+                "Check credentials, API enablement, and table options (e.g. OAuth for mine=true)."
+            )
+        if status == 429:
+            raise ValueError(
+                f"YouTube API {path} returned 429 Too Many Requests after retries. "
+                f"Detail: {message}"
+            )
+        raise ValueError(
+            f"YouTube API {path} returned HTTP {status}. Detail: {message}"
+        )
 
 
     def _get_nested(d: dict, path: str, default: str | None = None) -> str | None:
@@ -931,7 +1003,7 @@ def register_lakeflow_source(spark):
 
 
     def _flatten_search_result(item: dict, result_index: str, search_query: str) -> dict:
-        """Flatten a search result. (search_query, result_index) is unique across runs."""
+        """Flatten a search result. PK is (search_query, result_index) with stable position index."""
         id_obj = item.get("id") or {}
         return {
             "search_query": search_query,
@@ -971,29 +1043,24 @@ def register_lakeflow_source(spark):
 
     def _flatten_comment_thread(item: dict) -> dict:
         """Flatten a commentThread resource to schema fields."""
-        top = (item.get("snippet") or {}).get("topLevelComment") or {}
-        top_snip = top.get("snippet") if isinstance(top, dict) else {}
+        snip = item.get("snippet") or {}
+        top = snip.get("topLevelComment") or {}
+        top_snip = (top.get("snippet") if isinstance(top, dict) else None) or {}
         return {
             "id": item.get("id") or "",
             "snippet_videoId": _get_nested(item, "snippet.videoId"),
             "snippet_topLevelComment_id": top.get("id") if isinstance(top, dict) else None,
-            "snippet_topLevelComment_snippet_textDisplay": (
-                top_snip.get("textDisplay") if isinstance(top_snip, dict) else None
-            ),
-            "snippet_topLevelComment_snippet_authorDisplayName": (
-                top_snip.get("authorDisplayName") if isinstance(top_snip, dict) else None
-            ),
-            "snippet_topLevelComment_snippet_publishedAt": (
-                top_snip.get("publishedAt") if isinstance(top_snip, dict) else None
-            ),
+            "snippet_topLevelComment_snippet_textDisplay": top_snip.get("textDisplay"),
+            "snippet_topLevelComment_snippet_authorDisplayName": top_snip.get("authorDisplayName"),
+            "snippet_topLevelComment_snippet_publishedAt": top_snip.get("publishedAt"),
             "snippet_topLevelComment_snippet_likeCount": (
-                str(top_snip.get("likeCount")) if isinstance(top_snip, dict) and top_snip.get("likeCount") is not None else None
+                str(top_snip.get("likeCount")) if top_snip.get("likeCount") is not None else None
             ),
-            "snippet_canReply": str(item.get("snippet", {}).get("canReply")) if item.get("snippet", {}).get("canReply") is not None else None,
+            "snippet_canReply": (
+                str(snip.get("canReply")) if snip.get("canReply") is not None else None
+            ),
             "snippet_totalReplyCount": (
-                str(item.get("snippet", {}).get("totalReplyCount"))
-                if item.get("snippet", {}).get("totalReplyCount") is not None
-                else None
+                str(snip.get("totalReplyCount")) if snip.get("totalReplyCount") is not None else None
             ),
         }
 
@@ -1016,13 +1083,12 @@ def register_lakeflow_source(spark):
 
     def _flatten_video_category(item: dict) -> dict:
         """Flatten a videoCategory resource to schema fields."""
+        snip = item.get("snippet") or {}
         return {
             "id": item.get("id") or "",
             "snippet_title": _get_nested(item, "snippet.title"),
             "snippet_assignable": (
-                str(item.get("snippet", {}).get("assignable"))
-                if item.get("snippet", {}).get("assignable") is not None
-                else None
+                str(snip.get("assignable")) if snip.get("assignable") is not None else None
             ),
             "snippet_channelId": _get_nested(item, "snippet.channelId"),
         }
@@ -1041,6 +1107,12 @@ def register_lakeflow_source(spark):
             self._client_id = (options.get("client_id") or "").strip()
             self._client_secret = (options.get("client_secret") or "").strip()
             self._refresh_token = (options.get("refresh_token") or "").strip()
+            has_oauth = bool(self._client_id and self._client_secret and self._refresh_token)
+            if self._api_key and has_oauth:
+                raise ValueError(
+                    "YouTube connector requires either 'api_key' or all of "
+                    "'client_id', 'client_secret', 'refresh_token' in options, not both"
+                )
             if self._api_key:
                 self._access_token = None
                 self._token_expires_at = 0.0
@@ -1073,14 +1145,26 @@ def register_lakeflow_source(spark):
                     "YouTube OAuth returned 401. Check client_id, client_secret, "
                     "and refresh_token; re-run OAuth flow if needed."
                 )
+            if resp.status_code == 400:
+                try:
+                    if resp.json().get("error") == "invalid_grant":
+                        raise ValueError(
+                            "YouTube OAuth refresh failed (invalid_grant). The refresh token "
+                            "may be revoked or expired. Re-run authenticate.py and update "
+                            "the connection."
+                        )
+                except ValueError:
+                    raise
+                except Exception:
+                    pass
             resp.raise_for_status()
             data = resp.json()
             self._access_token = data["access_token"]
             self._token_expires_at = time.time() + data.get("expires_in", 3600)
             return self._access_token
 
-        def _request(self, method: str, path: str, params: dict[str, Any] | None = None) -> requests.Response:
-            """Issue GET with auth and retry on 429/5xx."""
+        def _request(self, path: str, params: dict[str, Any] | None = None) -> requests.Response:
+            """Issue GET with auth and retry on 429/5xx; honor Retry-After when present."""
             params = dict(params or {})
             if self._api_key:
                 params["key"] = self._api_key
@@ -1094,9 +1178,15 @@ def register_lakeflow_source(spark):
                 if resp.status_code not in RETRIABLE_STATUS_CODES:
                     return resp
                 if attempt < MAX_RETRIES - 1:
-                    time.sleep(backoff)
+                    time.sleep(_retry_wait_seconds(resp, backoff))
                     backoff *= 2
             return resp
+
+        def _ensure_ok(
+            self, resp: requests.Response, path: str, *, detail: str | None = None
+        ) -> None:
+            """Raise ValueError with a clear message when the API response is an error."""
+            _raise_for_youtube_api_error(resp, path, detail=detail)
 
         def _validate_table(self, table_name: str) -> None:
             if table_name not in SUPPORTED_TABLES:
@@ -1138,6 +1228,8 @@ def register_lakeflow_source(spark):
         def _read_channels(
             self, start_offset: dict, table_options: dict[str, str]
         ) -> tuple[Iterator[dict], dict]:
+            if start_offset and "pageToken" in start_offset and start_offset.get("pageToken") is None:
+                return iter([]), {"pageToken": None}
             part = "snippet,statistics,contentDetails"
             params = {"part": part, "maxResults": _max_results(table_options, cap=50)}
             channel_ids = (table_options.get("channel_ids") or "").strip()
@@ -1152,8 +1244,8 @@ def register_lakeflow_source(spark):
             page_token = start_offset.get("pageToken")
             if page_token:
                 params["pageToken"] = page_token
-            resp = self._request("GET", "channels", params=params)
-            resp.raise_for_status()
+            resp = self._request("channels", params=params)
+            self._ensure_ok(resp, "channels")
             data = resp.json()
             items = data.get("items") or []
             records = [_flatten_channel(i) for i in items]
@@ -1164,6 +1256,8 @@ def register_lakeflow_source(spark):
         def _read_playlists(
             self, start_offset: dict, table_options: dict[str, str]
         ) -> tuple[Iterator[dict], dict]:
+            if start_offset and "pageToken" in start_offset and start_offset.get("pageToken") is None:
+                return iter([]), {"pageToken": None}
             params = {"part": "snippet,contentDetails", "maxResults": _max_results(table_options, cap=50)}
             pl_ids = (table_options.get("playlist_ids") or "").strip()
             ch_id = (table_options.get("channel_id") or "").strip()
@@ -1178,8 +1272,8 @@ def register_lakeflow_source(spark):
             page_token = start_offset.get("pageToken")
             if page_token:
                 params["pageToken"] = page_token
-            resp = self._request("GET", "playlists", params=params)
-            resp.raise_for_status()
+            resp = self._request("playlists", params=params)
+            self._ensure_ok(resp, "playlists")
             data = resp.json()
             items = data.get("items") or []
             records = [_flatten_playlist(i) for i in items]
@@ -1209,8 +1303,8 @@ def register_lakeflow_source(spark):
                 }
                 if page_token:
                     params["pageToken"] = page_token
-                resp = self._request("GET", "playlistItems", params=params)
-                resp.raise_for_status()
+                resp = self._request("playlistItems", params=params)
+                self._ensure_ok(resp, "playlistItems")
                 data = resp.json()
                 items = data.get("items") or []
                 all_records.extend([_flatten_playlist_item(i) for i in items])
@@ -1230,8 +1324,8 @@ def register_lakeflow_source(spark):
             use_chart = (table_options.get("chart") or "").lower() == "mostpopular"
             if video_ids:
                 params["id"] = video_ids
-                resp = self._request("GET", "videos", params=params)
-                resp.raise_for_status()
+                resp = self._request("videos", params=params)
+                self._ensure_ok(resp, "videos")
                 data = resp.json()
                 items = data.get("items") or []
                 records = [_flatten_video(i) for i in items]
@@ -1250,8 +1344,8 @@ def register_lakeflow_source(spark):
                         p["videoCategoryId"] = table_options["video_category_id"]
                     if page_token:
                         p["pageToken"] = page_token
-                    resp = self._request("GET", "videos", params=p)
-                    resp.raise_for_status()
+                    resp = self._request("videos", params=p)
+                    self._ensure_ok(resp, "videos")
                     data = resp.json()
                     items = data.get("items") or []
                     all_records.extend([_flatten_video(i) for i in items])
@@ -1276,7 +1370,6 @@ def register_lakeflow_source(spark):
             max_pages = max(1, min(max_pages, 100))
             all_records: list[dict] = []
             page_token: str | None = None
-            batch_id = str(uuid.uuid4())
             position = 0
             for _ in range(max_pages):
                 params = {"part": "snippet", "q": q, "maxResults": _max_results(table_options, cap=50)}
@@ -1290,13 +1383,12 @@ def register_lakeflow_source(spark):
                     params["order"] = table_options["order"]
                 if page_token:
                     params["pageToken"] = page_token
-                resp = self._request("GET", "search", params=params)
-                resp.raise_for_status()
+                resp = self._request("search", params=params)
+                self._ensure_ok(resp, "search")
                 data = resp.json()
                 items = data.get("items") or []
                 for it in items:
-                    idx = f"{batch_id}_{position}"
-                    all_records.append(_flatten_search_result(it, idx, q))
+                    all_records.append(_flatten_search_result(it, str(position), q))
                     position += 1
                 page_token = data.get("nextPageToken")
                 if not page_token:
@@ -1306,6 +1398,8 @@ def register_lakeflow_source(spark):
         def _read_activities(
             self, start_offset: dict, table_options: dict[str, str]
         ) -> tuple[Iterator[dict], dict]:
+            if start_offset and "pageToken" in start_offset and start_offset.get("pageToken") is None:
+                return iter([]), {"pageToken": None}
             params = {"part": "snippet,contentDetails", "maxResults": _max_results(table_options, cap=50)}
             ch_id = (table_options.get("channel_id") or "").strip()
             if ch_id:
@@ -1319,8 +1413,8 @@ def register_lakeflow_source(spark):
             page_token = start_offset.get("pageToken")
             if page_token:
                 params["pageToken"] = page_token
-            resp = self._request("GET", "activities", params=params)
-            resp.raise_for_status()
+            resp = self._request("activities", params=params)
+            self._ensure_ok(resp, "activities")
             data = resp.json()
             items = data.get("items") or []
             records = [_flatten_activity(i) for i in items]
@@ -1331,6 +1425,8 @@ def register_lakeflow_source(spark):
         def _read_comment_threads(
             self, start_offset: dict, table_options: dict[str, str]
         ) -> tuple[Iterator[dict], dict]:
+            if start_offset and "pageToken" in start_offset and start_offset.get("pageToken") is None:
+                return iter([]), {"pageToken": None}
             video_id = (table_options.get("video_id") or "").strip()
             channel_id = (table_options.get("channel_id") or "").strip()
             mr = _max_results(table_options, default=MAX_RESULTS_COMMENT_THREADS, cap=100)
@@ -1343,20 +1439,9 @@ def register_lakeflow_source(spark):
             page_token = start_offset.get("pageToken")
             if page_token:
                 params["pageToken"] = page_token
-            resp = self._request("GET", "commentThreads", params=params)
-            if resp.status_code == 403:
-                try:
-                    err = resp.json().get("error", {})
-                    reason = err.get("errors", [{}])[0].get("reason", "") or err.get("message", "")
-                except Exception:
-                    reason = resp.text or "unknown"
-                ident = f"video_id={video_id}" if video_id else f"channel_id={channel_id}"
-                raise ValueError(
-                    "comment_threads returned 403 Forbidden. Comments may be disabled for this "
-                    f"video or channel ({ident}), or it may be restricted. Try a different video_id, "
-                    "or see README for channel_id limitations. API reason: " + str(reason)[:200]
-                )
-            resp.raise_for_status()
+            resp = self._request("commentThreads", params=params)
+            ident = f"video_id={video_id}" if video_id else f"channel_id={channel_id}"
+            self._ensure_ok(resp, "commentThreads", detail=ident)
             data = resp.json()
             items = data.get("items") or []
             records = [_flatten_comment_thread(i) for i in items]
@@ -1367,6 +1452,8 @@ def register_lakeflow_source(spark):
         def _read_subscriptions(
             self, start_offset: dict, table_options: dict[str, str]
         ) -> tuple[Iterator[dict], dict]:
+            if start_offset and "pageToken" in start_offset and start_offset.get("pageToken") is None:
+                return iter([]), {"pageToken": None}
             params = {"part": "snippet", "maxResults": _max_results(table_options, cap=50)}
             ch_id = (table_options.get("channel_id") or "").strip()
             if ch_id:
@@ -1378,8 +1465,8 @@ def register_lakeflow_source(spark):
             page_token = start_offset.get("pageToken")
             if page_token:
                 params["pageToken"] = page_token
-            resp = self._request("GET", "subscriptions", params=params)
-            resp.raise_for_status()
+            resp = self._request("subscriptions", params=params)
+            self._ensure_ok(resp, "subscriptions")
             data = resp.json()
             items = data.get("items") or []
             records = [_flatten_subscription(i) for i in items]
@@ -1390,14 +1477,24 @@ def register_lakeflow_source(spark):
         def _read_video_categories(
             self, start_offset: dict, table_options: dict[str, str]
         ) -> tuple[Iterator[dict], dict]:
-            params = {"part": "snippet", "maxResults": _max_results(table_options, cap=50)}
-            if table_options.get("region_code"):
-                params["regionCode"] = table_options["region_code"]
+            if start_offset and "pageToken" in start_offset and start_offset.get("pageToken") is None:
+                return iter([]), {"pageToken": None}
+            region_code = (table_options.get("region_code") or "").strip()
+            if not region_code:
+                raise ValueError(
+                    "video_categories requires region_code in table_options "
+                    "(ISO 3166-1 alpha-2, e.g. US)"
+                )
+            params = {
+                "part": "snippet",
+                "maxResults": _max_results(table_options, cap=50),
+                "regionCode": region_code,
+            }
             page_token = start_offset.get("pageToken")
             if page_token:
                 params["pageToken"] = page_token
-            resp = self._request("GET", "videoCategories", params=params)
-            resp.raise_for_status()
+            resp = self._request("videoCategories", params=params)
+            self._ensure_ok(resp, "videoCategories")
             data = resp.json()
             items = data.get("items") or []
             records = [_flatten_video_category(i) for i in items]
